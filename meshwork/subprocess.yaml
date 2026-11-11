@@ -1,0 +1,12 @@
+root: ..
+implementations:
+  house-data.process:
+    argv: [python, "${ROOT}/src/data/run_processing.py"]
+    inputs:
+      raw: data/raw/house_data.csv
+    outputs:
+      cleaned: data/processed/cleaned_house_data.csv
+inputs:
+  raw_csv: data/raw/house_data.csv
+outputs:
+  cleaned_csv: data/processed/cleaned_house_data.csv
