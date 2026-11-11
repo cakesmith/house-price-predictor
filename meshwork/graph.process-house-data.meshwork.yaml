@@ -1,0 +1,10 @@
+namespace: /process-house-data
+places:
+  raw: RawHousingCSV
+  cleaned: CleanedHousingCSV
+transitions:
+  clean:
+    implementation: house-data.process
+arcs:
+  - [raw, clean]
+  - [clean, cleaned]

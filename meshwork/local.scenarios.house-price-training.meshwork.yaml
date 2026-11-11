@@ -1,0 +1,8 @@
+graph: house-price-training
+scenarios:
+  - name: clean
+  - name: reproduce
+    marking:
+      raw_csv: "bd3e16ffa5529d9bd6696e1d8893a6a43f02089faae03371130f69ef1dd19335"
+    expect:
+      cleaned_csv: "46751dff1702df5d343340ea3312e8780d529ea6642d41b3dbae96a74e80457f"

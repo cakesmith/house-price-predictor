@@ -1,0 +1,8 @@
+namespace: /house-price-training
+places:
+  raw_csv: RawHousingCSV
+  cleaned_csv: CleanedHousingCSV
+references:
+  - graph: process-house-data
+    namespace: processing
+    bindings: {raw: raw_csv, cleaned: cleaned_csv}
