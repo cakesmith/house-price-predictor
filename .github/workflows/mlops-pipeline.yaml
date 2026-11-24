@@ -1,0 +1,354 @@
+name: MLOps Pipeline
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [main]
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+    paths:
+      - '.github/workflows/mlops-pipeline.yaml'
+      - 'Dockerfile'
+      - 'requirements.txt'
+      - 'configs/**'
+      - 'data/**'
+      - 'src/**'
+      - 'deployment/kubernetes/scripts/check-api-image.sh'
+  workflow_dispatch:
+    inputs:
+      run_all:
+        description: 'Run all jobs'
+        type: boolean
+        required: false
+        default: true
+      run_data_processing:
+        description: 'Run data processing job'
+        type: boolean
+        required: false
+        default: false
+      run_model_training:
+        description: 'Run model training job'
+        type: boolean
+        required: false
+        default: false
+      run_build:
+        description: 'Build and test the image'
+        type: boolean
+        required: false
+        default: false
+      run_publish:
+        description: 'Build and publish the image to Docker Hub'
+        type: boolean
+        required: false
+        default: false
+      run_deploy:
+        description: 'Promote a published API image to the Kubernetes lab'
+        type: boolean
+        required: false
+        default: false
+      deploy_image:
+        description: 'Published API tag or sha256 digest. Enable run_deploy and turn off other options.'
+        type: string
+        required: false
+
+permissions:
+  contents: read
+
+# Let newer PR commits replace old checks and serialize automatic main builds.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  data-processing:
+    if: >-
+      github.event_name == 'pull_request' || (github.event_name == 'push' && github.event.ref == 'refs/heads/main' && !github.event.deleted) ||
+      (!inputs.deploy_image && (inputs.run_all || inputs.run_data_processing ||
+      inputs.run_model_training || inputs.run_build || inputs.run_publish))
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+      
+    - name: Set up Python
+      uses: actions/setup-python@v7
+      with:
+        python-version: '3.11'
+        
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        
+    - name: Process data
+      run: |
+        python src/data/run_processing.py --input data/raw/house_data.csv --output data/processed/cleaned_house_data.csv 
+        
+    - name: Engineer features
+      run: |
+        python src/features/engineer.py --input data/processed/cleaned_house_data.csv --output data/processed/featured_house_data.csv --preprocessor models/trained/preprocessor.pkl
+        
+    - name: Upload processed data
+      uses: actions/upload-artifact@v7
+      with:
+        name: processed-data
+        path: data/processed/featured_house_data.csv
+        
+    - name: Upload preprocessor
+      uses: actions/upload-artifact@v7
+      with:
+        name: preprocessor
+        path: models/trained/preprocessor.pkl
+        
+  model-training:
+    if: >-
+      github.event_name == 'pull_request' || (github.event_name == 'push' && github.event.ref == 'refs/heads/main' && !github.event.deleted) || inputs.run_all ||
+      inputs.run_model_training || inputs.run_build || inputs.run_publish
+    needs: data-processing
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+      
+    - name: Set up Python
+      uses: actions/setup-python@v7
+      with:
+        python-version: '3.11'
+        
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        
+    - name: Download processed data
+      uses: actions/download-artifact@v7
+      with:
+        name: processed-data
+        path: data/processed/
+        
+    - name: Set up MLflow
+      run: |
+        docker pull ghcr.io/mlflow/mlflow:latest
+        docker run -d -p 5000:5000 --name mlflow-server ghcr.io/mlflow/mlflow:latest mlflow server --host 0.0.0.0 --backend-store-uri sqlite:///mlflow.db
+        
+    - name: Wait for MLflow to start
+      run: |
+        for i in {1..10}; do
+          curl -f http://localhost:5000/health || sleep 5;
+        done
+        
+    - name: Train model
+      run: |
+        mkdir -p models
+        python src/models/train_model.py --config configs/model_config.yaml --data data/processed/featured_house_data.csv --models-dir models --mlflow-tracking-uri http://localhost:5000
+        
+    - name: Upload trained model
+      uses: actions/upload-artifact@v7
+      with:
+        name: trained-model
+        path: models/
+        
+    - name: Clean up MLflow
+      run: |
+        docker stop mlflow-server || true
+        docker rm mlflow-server || true
+        
+  build-and-publish:
+    if: >-
+      github.event_name == 'pull_request' || (github.event_name == 'push' && github.event.ref == 'refs/heads/main' && !github.event.deleted) ||
+      inputs.run_all || inputs.run_build || inputs.run_publish
+    needs: model-training
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.publish.outputs.digest }}
+    env:
+      IMAGE_REPOSITORY: docker.io/${{ vars.DOCKERHUB_USERNAME }}/house-price-model
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+      
+    - name: Download trained model
+      uses: actions/download-artifact@v7
+      with:
+        name: trained-model
+        path: models/
+        
+    - name: Download preprocessor
+      uses: actions/download-artifact@v7
+      with:
+        name: preprocessor
+        path: models/trained/
+        
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v4
+      
+    - name: Build and test Docker image
+      run: |
+        set -euo pipefail
+        image="house-price-model:$GITHUB_SHA"
+        docker build --tag "$image" --file Dockerfile .
+        deployment/kubernetes/scripts/check-api-image.sh "$image"
+
+    - name: Log in to Docker Hub
+      if: >-
+        (github.event_name == 'push' && github.event.ref == 'refs/heads/main' && !github.event.deleted) ||
+        (github.event_name == 'workflow_dispatch' && (inputs.run_all || inputs.run_publish))
+      uses: docker/login-action@v4
+      with:
+        registry: docker.io
+        username: ${{ vars.DOCKERHUB_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+    - name: Push tested Docker image
+      id: publish
+      if: >-
+        (github.event_name == 'push' && github.event.ref == 'refs/heads/main' && !github.event.deleted) ||
+        (github.event_name == 'workflow_dispatch' && (inputs.run_all || inputs.run_publish))
+      run: |
+        set -euo pipefail
+        image="house-price-model:$GITHUB_SHA"
+        docker tag "$image" "$IMAGE_REPOSITORY:$GITHUB_SHA"
+        docker push "$IMAGE_REPOSITORY:$GITHUB_SHA" | tee "$RUNNER_TEMP/image-push.log"
+        digest=$(awk '/digest: sha256:/ { print $3 }' "$RUNNER_TEMP/image-push.log")
+        [[ $digest =~ ^sha256:[0-9a-f]{64}$ ]]
+        for tag in "${GITHUB_SHA:0:7}" latest; do
+          docker tag "$image" "$IMAGE_REPOSITORY:$tag"
+          docker push "$IMAGE_REPOSITORY:$tag"
+        done
+        printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+
+  promote:
+    name: Promote house-price API to the Kubernetes lab
+    needs: build-and-publish
+    # An explicit image skips the build path and is validated before use.
+    if: >-
+      ${{ !cancelled() &&
+          ((github.event_name == 'push' && github.event.ref == 'refs/heads/main' && !github.event.deleted) ||
+           (github.event_name == 'workflow_dispatch' && (inputs.run_all || inputs.run_deploy || inputs.deploy_image))) &&
+          (needs.build-and-publish.result == 'success' ||
+           (needs.build-and-publish.result == 'skipped' && github.event_name == 'workflow_dispatch' &&
+            (inputs.deploy_image || (!inputs.run_all && !inputs.run_build && !inputs.run_publish)))) }}
+    runs-on: ubuntu-24.04
+    environment: kthw-lab
+    permissions:
+      contents: write
+      actions: write
+    concurrency:
+      group: house-price-deploy
+      cancel-in-progress: false
+    env:
+      IMAGE_REPOSITORY: docker.io/${{ vars.DOCKERHUB_USERNAME }}/house-price-model
+      PUBLISHED_DIGEST: ${{ needs.build-and-publish.outputs.digest }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+    - name: Validate manual promotion options
+      if: >-
+        inputs.deploy_image && (!inputs.run_deploy || inputs.run_all ||
+        inputs.run_data_processing || inputs.run_model_training || inputs.run_build || inputs.run_publish)
+      run: |
+        echo '::error::To use deploy_image, enable run_deploy and turn off all other run options.'
+        exit 1
+    - name: Check out main for the lab configuration update
+      uses: actions/checkout@v7
+      with:
+        ref: main
+    - name: Resolve the published image and smoke-test a prediction
+      id: existing
+      if: needs.build-and-publish.outputs.digest == ''
+      env:
+        DEPLOY_IMAGE: ${{ inputs.deploy_image }}
+      run: |
+        set -euo pipefail
+        if [[ $DEPLOY_IMAGE =~ ^sha256:[0-9a-f]{64}$ ]]; then
+          digest=$DEPLOY_IMAGE
+          image="$IMAGE_REPOSITORY@$digest"
+        elif [[ $DEPLOY_IMAGE =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}$ ]]; then
+          image="$IMAGE_REPOSITORY:$DEPLOY_IMAGE"
+        elif [[ -z $DEPLOY_IMAGE ]]; then
+          image="$IMAGE_REPOSITORY:$GITHUB_SHA"
+          if ! docker manifest inspect "$image" >/dev/null 2>&1; then
+            image="$IMAGE_REPOSITORY:${GITHUB_SHA:0:7}"
+          fi
+        else
+          echo '::error::deploy_image must be a Docker tag or a sha256 digest for the configured API image repository.'
+          exit 1
+        fi
+
+        printf 'Pulling the published image %s.\n' "$image"
+        if ! docker pull "$image"; then
+          printf '::error::Could not pull %s. Set deploy_image to an existing tag or digest.\n' "$image"
+          exit 1
+        fi
+        if [[ -z ${digest:-} ]]; then
+          pinned_image=$(docker image inspect "$image" --format '{{index .RepoDigests 0}}')
+          digest=${pinned_image##*@}
+          [[ $digest =~ ^sha256:[0-9a-f]{64}$ ]]
+        fi
+        printf 'Smoke-testing the API at %s@%s.\n' "$IMAGE_REPOSITORY" "$digest"
+        deployment/kubernetes/scripts/check-api-image.sh "$IMAGE_REPOSITORY@$digest"
+        printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+    - name: Pin the tested digest, validate Helm, and update main
+      env:
+        EXISTING_DIGEST: ${{ steps.existing.outputs.digest }}
+      run: |
+        if [[ -n $PUBLISHED_DIGEST ]]; then
+          source='Built, smoke-tested, and published by this pipeline run.'
+        else
+          source='Pulled from Docker Hub and smoke-tested by this promotion job.'
+        fi
+        printf 'Image source: %s\n' "$source"
+        printf '## Kubernetes lab promotion\n\n- Image source: %s\n' "$source" >> "$GITHUB_STEP_SUMMARY"
+        deployment/kubernetes/scripts/promote-lab-image.sh "$IMAGE_REPOSITORY" "${PUBLISHED_DIGEST:-$EXISTING_DIGEST}"
+
+  publish-version:
+    if: github.event_name == 'push' && github.ref_type == 'tag' && !github.event.deleted
+    runs-on: ubuntu-24.04
+    env:
+      IMAGE_REPOSITORY: docker.io/${{ vars.DOCKERHUB_USERNAME }}/house-price-model
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        fetch-depth: 0
+        persist-credentials: false
+
+    - name: Read the lab image pinned at this version
+      id: image
+      run: |
+        set -euo pipefail
+        if ! git merge-base --is-ancestor HEAD refs/remotes/origin/main; then
+          echo '::error::Push the version tag from a commit on main.'
+          exit 1
+        fi
+        values=deployment/kubernetes/house-price-model/values-kthw-lab.yaml
+        repository=$(yq -r '.api.image.repository' "$values")
+        digest=$(yq -r '.api.image.digest' "$values")
+        if [[ $repository != "$IMAGE_REPOSITORY" || ! $digest =~ ^sha256:[0-9a-f]{64}$ ]]; then
+          echo '::error::The tagged lab values must pin a digest in the configured API image repository.'
+          exit 1
+        fi
+        printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+
+    - uses: docker/setup-buildx-action@v4
+
+    - uses: docker/login-action@v4
+      with:
+        registry: docker.io
+        username: ${{ vars.DOCKERHUB_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+    - name: Publish the version tag for the tested image
+      env:
+        IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+      run: |
+        docker buildx imagetools create --prefer-index=false \
+          --tag "$IMAGE_REPOSITORY:$GITHUB_REF_NAME" "$IMAGE_REPOSITORY@$IMAGE_DIGEST"
